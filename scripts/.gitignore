@@ -1,0 +1,15 @@
+# data & outputs
+data/
+outputs/
+*.csv
+*.tsv
+*.xlsx
+
+# figures
+*.png
+*.pdf
+
+# R / RStudio
+.Rhistory
+.RData
+.Rproj.user/
