@@ -1,0 +1,181 @@
+#!/usr/bin/env Rscript
+# ============================================================
+# Salmonella MLST Dumbbell Plot (Clinical vs Egg)
+# - Reads metadata CSV
+# - Summarizes ST counts by source
+# - Labels each ST with dominant serovar
+# - Produces a dumbbell plot for top N STs
+#
+# Author: Aat (edit as needed)
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(janitor)
+  library(stringr)
+})
+
+# -----------------------------
+# 0) User settings (EDIT HERE)
+# -----------------------------
+INPUT_CSV <- "/Users/aat/Documents/CE/metadata_master.csv"
+OUT_DIR   <- "/Users/aat/Documents/CE"
+TOP_N_ST  <- 20
+
+# Colors (journal-friendly; edit if needed)
+col_clinical <- "#D55E00"  # red/orange
+col_egg      <- "#009E73"  # teal/green
+
+# Source label standardization (edit synonyms if your file uses different terms)
+SOURCE_MAP <- function(x) {
+  x2 <- tolower(as.character(x))
+  case_when(
+    x2 %in% c("clinical", "human", "patient", "h") ~ "Clinical",
+    x2 %in% c("egg", "eggs", "food", "poultry egg", "poultry_egg", "layer egg") ~ "Egg",
+    TRUE ~ as.character(x)
+  )
+}
+
+# -----------------------------
+# 1) Helper: detect column names
+# -----------------------------
+pick_col <- function(df, candidates) {
+  nms <- names(df)
+  hit <- intersect(candidates, nms)
+  if (length(hit) == 0) NA_character_ else hit[1]
+}
+
+cand_id <- c("isolate_id","sample_id","isolate","sample","id","lab_id","isolateid")
+cand_source <- c("source","isolation_source","origin","sample_source","host_source","specimen_source")
+cand_st <- c("st","sequence_type","mlst_st","mlst","seq_type","sequence_type_achtman")
+cand_sero <- c("serovar","serotype","sero","serotype_pred","serovar_pred","salmonella_serovar")
+
+# -----------------------------
+# 2) Read & standardize metadata
+# -----------------------------
+metadata <- read_csv(INPUT_CSV, show_col_types = FALSE) %>%
+  clean_names()
+
+col_map <- list(
+  isolate_id = pick_col(metadata, cand_id),
+  source     = pick_col(metadata, cand_source),
+  st         = pick_col(metadata, cand_st),
+  serovar    = pick_col(metadata, cand_sero)
+)
+
+cat("\n=== Detected column mapping ===\n")
+print(col_map)
+
+if (is.na(col_map$source) || is.na(col_map$st)) {
+  stop("Could not detect required columns for 'source' and/or 'st'. Please rename columns or update candidate lists.")
+}
+
+mlst_df <- metadata %>%
+  transmute(
+    isolate_id = if (!is.na(col_map$isolate_id)) .data[[col_map$isolate_id]] else NA,
+    source_raw = .data[[col_map$source]],
+    st_raw     = .data[[col_map$st]],
+    serovar    = if (!is.na(col_map$serovar)) .data[[col_map$serovar]] else NA
+  ) %>%
+  mutate(
+    source = SOURCE_MAP(source_raw),
+    st = as.character(st_raw) %>%
+      str_trim() %>%
+      str_replace_all("^st\\s*", "") %>%  # remove leading "ST"
+      na_if("") ,
+    serovar = as.character(serovar) %>%
+      str_trim() %>%
+      na_if("")
+  ) %>%
+  filter(!is.na(source), !is.na(st), st != "-", st != "")
+
+cat("\n=== Sources found ===\n")
+print(sort(unique(mlst_df$source)))
+
+# -----------------------------
+# 3) ST counts by source
+# -----------------------------
+st_summary <- mlst_df %>%
+  count(source, st, name = "n") %>%
+  mutate(source = factor(source, levels = c("Egg", "Clinical"))) %>%
+  arrange(desc(n))
+
+# -----------------------------
+# 4) Dominant serovar per ST (for label)
+# -----------------------------
+st_serovar_labels <- mlst_df %>%
+  filter(!is.na(serovar)) %>%
+  count(st, serovar, name = "n") %>%
+  group_by(st) %>%
+  slice_max(n, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(
+    serovar2 = str_replace_all(serovar, "_", " "),
+    st_label = paste0("ST ", st, " — ", serovar2)
+  ) %>%
+  select(st, st_label)
+
+# -----------------------------
+# 5) Select top N STs by total
+# -----------------------------
+top_st <- st_summary %>%
+  group_by(st) %>%
+  summarise(total = sum(n), .groups = "drop") %>%
+  arrange(desc(total)) %>%
+  slice_head(n = TOP_N_ST) %>%
+  pull(st)
+
+# -----------------------------
+# 6) Build dumbbell dataframe (wide)
+# -----------------------------
+db <- st_summary %>%
+  filter(st %in% top_st) %>%
+  select(source, st, n) %>%
+  pivot_wider(names_from = source, values_from = n, values_fill = 0) %>%
+  left_join(st_serovar_labels, by = "st") %>%
+  mutate(st_label = ifelse(is.na(st_label), paste0("ST ", st), st_label)) %>%
+  arrange(pmax(Clinical, Egg)) %>%
+  mutate(st_label = factor(st_label, levels = st_label))
+
+# -----------------------------
+# 7) Plot
+# -----------------------------
+p <- ggplot(db, aes(y = st_label)) +
+  geom_segment(
+    aes(x = Egg, xend = Clinical, yend = st_label),
+    linewidth = 0.8,
+    color = "grey70"
+  ) +
+  geom_point(aes(x = Egg, color = "Egg"), size = 3) +
+  geom_point(aes(x = Clinical, color = "Clinical"), size = 3) +
+  scale_color_manual(
+    name = "Source",
+    values = c("Clinical" = col_clinical, "Egg" = col_egg)
+  ) +
+  labs(
+    x = "Number of isolates",
+    y = NULL,
+    title = "MLST distribution of Salmonella sequence types by source",
+    subtitle = paste0("Comparison between clinical and egg isolates (top ", TOP_N_ST, " STs)")
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+print(p)
+
+# -----------------------------
+# 8) Save outputs
+# -----------------------------
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+out_png <- file.path(OUT_DIR, paste0("Fig_MLST_dumbbell_top", TOP_N_ST, ".png"))
+ggsave(out_png, plot = p, width = 9, height = 6, dpi = 300)
+
+# Save the plotting table too (useful for manuscript supplements)
+write_csv(db, file.path(OUT_DIR, paste0("MLST_dumbbell_table_top", TOP_N_ST, ".csv")))
+
+cat("\nSaved figure to:\n", out_png, "\n", sep = "")
